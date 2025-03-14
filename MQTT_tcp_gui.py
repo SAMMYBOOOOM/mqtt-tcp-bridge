@@ -8,7 +8,6 @@ from tkinter import messagebox
 import json
 import os
 import sys
-import certifi
 
 # Path to the JSON configuration file
 CONFIG_FILE = "config.json"
@@ -45,9 +44,6 @@ def preload_ssl():
     except Exception as e:
         print(f"SSL preload warning (non-fatal): {e}")
 
-# Call this function before showing the input window
-preload_ssl()
-
 # Function to load configuration from JSON file
 def load_config():
     global mqtt_server, mqtt_port, client_id, mqtt_username, mqtt_password, call_topic, response_topic, tcp_ip, tcp_port, use_tls
@@ -65,7 +61,6 @@ def load_config():
             tcp_port = config.get("tcp_port", 8080)
             use_tls = config.get("use_tls", True)
 
-
 # Function to save configuration to JSON file
 def save_config():
     config = {
@@ -78,11 +73,10 @@ def save_config():
         "response_topic": response_topic,
         "tcp_ip": tcp_ip,
         "tcp_port": tcp_port,
-        "use_tls": use_tls,
+        "use_tls": use_tls
     }
     with open(CONFIG_FILE, "w") as file:
         json.dump(config, file, indent=4)
-
 
 # Callback when the client connects to the broker
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -91,39 +85,35 @@ def on_connect(client, userdata, flags, reason_code, properties):
     client.subscribe(call_topic)
     client.publish(response_topic, "Connected to MQTT broker")
 
-
 # Callback when a message is received from the broker
 def on_message(client, userdata, msg):
     print(f"Received message on topic {msg.topic}: {len(msg.payload)} bytes")
-
+    
     # Forward the raw payload directly to all connected TCP clients
     with tcp_clients_lock:
         disconnected_clients = []
         for tcp_client in connected_tcp_clients:
             try:
                 tcp_client.sendall(msg.payload)
-                print(
-                    f"Forwarded {len(msg.payload)} bytes to TCP client {tcp_client.getpeername()}"
-                )
+                print(f"Forwarded {len(msg.payload)} bytes to TCP client {tcp_client.getpeername()}")
             except Exception as e:
                 print(f"Error sending to TCP client: {e}")
                 disconnected_clients.append(tcp_client)
-
+        
         # Remove disconnected clients
         for client in disconnected_clients:
             connected_tcp_clients.remove(client)
-
 
 # Function to handle TCP client connections
 def handle_tcp_client(client_socket):
     try:
         client_addr = client_socket.getpeername()
         print(f"TCP client connected: {client_addr}")
-
+        
         # Add the client to our list of connected clients
         with tcp_clients_lock:
             connected_tcp_clients.append(client_socket)
-
+        
         while True:
             # Receive data from the TCP client
             data = client_socket.recv(1024)
@@ -141,46 +131,48 @@ def handle_tcp_client(client_socket):
         with tcp_clients_lock:
             if client_socket in connected_tcp_clients:
                 connected_tcp_clients.remove(client_socket)
-
+        
         # Close the TCP client socket
         client_socket.close()
         print(f"TCP client {client_addr} disconnected")
 
-
 # Function to start the TCP server
 def start_tcp_server():
     global tcp_socket
-    try:
-        # Create a TCP socket
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Allow reuse of the address
-        tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind the socket to the IP and port
-        tcp_socket.bind((tcp_ip, tcp_port))
-        # Listen for incoming connections
-        tcp_socket.listen(5)
-        print(f"TCP server started on {tcp_ip}:{tcp_port}")
-        print("Waiting for TCP client connections...")
+    while True:  # Outer retry loop for TCP server
+        try:
+            # Create a TCP socket
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Allow reuse of the address
+            tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Bind the socket to the IP and port
+            tcp_socket.bind((tcp_ip, tcp_port))
+            # Listen for incoming connections
+            tcp_socket.listen(5)
+            print(f"TCP server started on {tcp_ip}:{tcp_port}")
+            print("Waiting for TCP client connections...")
 
-        while True:
-            # Accept a new connection
-            client_socket, client_address = tcp_socket.accept()
-            print(f"New TCP client connected: {client_address}")
-            # Handle the client in a new thread
-            client_thread = threading.Thread(
-                target=handle_tcp_client, args=(client_socket,)
-            )
-            client_thread.daemon = True
-            client_thread.start()
+            while True:
+                # Accept a new connection
+                client_socket, client_address = tcp_socket.accept()
+                print(f"New TCP client connected: {client_address}")
+                # Handle the client in a new thread
+                client_thread = threading.Thread(target=handle_tcp_client, args=(client_socket,))
+                client_thread.daemon = True
+                client_thread.start()
 
-    except Exception as e:
-        print(f"TCP server error: {e}")
-
-
+        except Exception as e:
+            print(f"TCP server error: {e}. Retrying in 0.5 seconds...")
+            # Cleanup before retry
+            if tcp_socket:
+                tcp_socket.close()
+            time.sleep(0.5)
+import certifi
 # Function to start the MQTT client
 def start_mqtt_client():
     global client
     if client is not None:
+        # Disconnect and clean up the existing MQTT client
         client.loop_stop()
         client.disconnect()
         print("Disconnected existing MQTT client")
@@ -209,19 +201,26 @@ def start_mqtt_client():
                 )
                 return
 
-    # Connect to the MQTT broker
-    try:
-        client.connect(mqtt_server, mqtt_port, 60)
-        print("Connected to MQTT broker")
-    except Exception as e:
-        print(f"Failed to connect to MQTT broker: {e}")
-        messagebox.showerror(
-            "Connection Error", f"Failed to connect to MQTT broker: {e}"
-        )
+    # Assign the callbacks
+    client.on_connect = on_connect
+    client.on_message = on_message
 
-    # Start the MQTT loop in a non-blocking manner
-    client.loop_start()
+    # Function to handle connection with retries
+    def connect_with_retry():
+        while True:
+            try:
+                client.connect(mqtt_server, mqtt_port, 60)
+                print("Connected to MQTT broker")
+                client.loop_start()
+                break  # Exit loop on success
+            except Exception as e:
+                print(f"Failed to connect to MQTT broker: {e}. Retrying in 0.5 seconds...")
+                time.sleep(0.5)
 
+    # Start the connection thread
+    connect_thread = threading.Thread(target=connect_with_retry)
+    connect_thread.daemon = True
+    connect_thread.start()
 
 # Function to handle the submit button click
 def on_submit():
@@ -252,14 +251,12 @@ def on_submit():
             tcp_socket.close()
     start_tcp_server_thread()
 
-
 # Function to start the TCP server in a separate thread
 def start_tcp_server_thread():
     global tcp_server_thread
     tcp_server_thread = threading.Thread(target=start_tcp_server)
     tcp_server_thread.daemon = True
     tcp_server_thread.start()
-
 
 # Function to show the input window
 def show_input_window():
@@ -277,9 +274,7 @@ def show_input_window():
     # Load the developer icon
     try:
         dev_image = Image.open("dev.png")
-        dev_image = dev_image.resize(
-            (50, 50), Image.Resampling.LANCZOS
-        )  # Resize the image if needed
+        dev_image = dev_image.resize((50, 50), Image.Resampling.LANCZOS)  # Resize the image if needed
         dev_icon = ImageTk.PhotoImage(dev_image)
     except Exception as e:
         print(f"Error loading developer icon: {e}")
@@ -345,9 +340,7 @@ def show_input_window():
 
     # Add a checkbox for enabling/disabling TLS
     use_tls_var = tk.BooleanVar(value=use_tls)
-    tls_checkbox = tk.Checkbutton(
-        input_window, text="Use TLS/SSL", variable=use_tls_var
-    )
+    tls_checkbox = tk.Checkbutton(input_window, text="Use TLS/SSL", variable=use_tls_var)
     tls_checkbox.grid(row=10, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
     # Create and place the submit button
@@ -371,9 +364,13 @@ def show_input_window():
     # Start the main loop for the input window
     input_window.mainloop()
 
+# Main entry point of the program
+if __name__ == "__main__":
+    # Call this function before showing the input window
+    preload_ssl()
+    
+    # Load the configuration from the JSON file
+    load_config()
 
-# Load the configuration from the JSON file
-load_config()
-
-# Show the input window
-show_input_window()
+    # Show the input window
+    show_input_window()
